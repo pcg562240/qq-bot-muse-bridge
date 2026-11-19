@@ -2,6 +2,9 @@ hidden_files/
 __pycache__/
 *.log
 *.bak
+*.db
+*.db-wal
+*.db-shm
 .venv/
 venv/
 .env

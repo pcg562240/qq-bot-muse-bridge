@@ -1,10 +1,25 @@
 #!/usr/bin/env python3
-"""QQ 官方 Bot 桥接 daemon（botpy，常驻网关连接）。
+"""QQ 官方 Bot 桥接 daemon（botpy，常驻网关连接）— SQLite 版。
 
 职责：
-- 连 QQ 网关收 C2C 私聊与群 @ 消息，写入 hidden_files/queue.jsonl。
-- 每 5 秒扫 hidden_files/outbox.jsonl，把待发回复经 BotAPI 发出。
-- 不直接回消息。回复正文由 Muse 的定时任务生成后写入 outbox。
+- 连 QQ 网关收 C2C 私聊与群 @ 消息，写入 SQLite 入站表。
+- 每 5 秒从 SQLite 出站表逐条认领待发回复，经 BotAPI 发出。
+- 不直接回消息。回复正文由 Muse 的定时任务经 enqueue_reply.py
+  写进出站表（与原消息标记已处理在同一个事务里）。
+
+相对旧版（queue.jsonl / outbox.jsonl / seen.json / seq.json）修掉的：
+1. outbox 整份读→await→整份重写：worker 在 await 期间追加的回复
+   会被重写丢弃（2026-11-19 假消息复现确认）。现为 SQLite 表，
+   worker INSERT（msg_id 唯一键），daemon 短事务逐条认领，不再重写。
+2. poller-seen.json 在 worker 写 outbox 时就标记，早于 daemon 实际
+   发出；被丢的回复下一轮直接跳过。现为同一事务：INSERT 出站行 +
+   inbound 状态改为 queued；原消息只有真正发出后才标记 done。
+3. 旧版把 botpy 超时当成功：BotHttp.request 在超时、断线重试耗尽时
+   返回 None（不抛异常），而旧 _send_one 只看有没有异常，None 就当
+   发出成功。现为：只有收到明确成功回执才标记 sent；返回 None、超时、
+   断线 → needs_check + 告警，不自动重发；腾讯明确拒绝（401/403/
+   404/405/429，服务端已应答并拒绝）→ failed，另行分类；
+   ServerError（500/504 等）按结果不明处理，因为不能证明消息未送达。
 
 凭据：环境变量 QQBOT_APPID / QQBOT_SECRET；若环境变量缺失，则读
 hidden_files/credentials.env（0600，仅这两行，永不打印）。
@@ -21,18 +36,20 @@ HTTP 200（2026-11-19）。
 - C2C 私聊：收到消息后 60 分钟内可被动回复，最多 5 条。
 - 群聊：收到 @ 消息后 5 分钟内可被动回复，最多 5 条。
 - 正式环境主动消息极严（私聊每用户每月 4 条），以被动回复为主。
-- 同一 msg_id + msg_seq 重复发送会失败，seq 由本文件维护。
+- 同一 msg_id + msg_seq 重复发送会失败，seq 在认领事务里分配并
+  持久化（store.seq_state），needs_check 的行保留原 seq，不自动换
+  新 seq 重发。
 
-状态文件都在 hidden_files/ 下：queue.jsonl（入站队列）、
-outbox.jsonl（待发回复）、seen.json（已收消息 id 去重）、
-seq.json（每条 msg_id 的下一个 msg_seq）、daemon.log。
+状态：hidden_files/bridge.db（SQLite，WAL）+ daemon.log +
+needs-check.log（待核对告警，轮询任务应巡检此文件）。
+数据库路径可用 QQBOT_DB_PATH 环境变量覆盖。
 """
 
 import asyncio
-import json
 import logging
 import os
 import sys
+import time
 from pathlib import Path
 
 import aiohttp
@@ -49,15 +66,34 @@ def _patched_session_init(self, *args, **kwargs):
 aiohttp.ClientSession.__init__ = _patched_session_init
 
 import botpy  # noqa: E402
+from botpy.errors import (  # noqa: E402
+    AuthenticationFailedError,
+    ForbiddenError,
+    MethodNotAllowedError,
+    NotFoundError,
+    SequenceNumberError,
+)
 from botpy.message import C2CMessage, GroupMessage, Message  # noqa: E402
 
 BASE = Path(__file__).resolve().parent
 HIDDEN = BASE / "hidden_files"
-QUEUE = HIDDEN / "queue.jsonl"
-OUTBOX = HIDDEN / "outbox.jsonl"
-SEEN = HIDDEN / "seen.json"
-SEQ = HIDDEN / "seq.json"
+DB = HIDDEN / "bridge.db"
 LOG = HIDDEN / "daemon.log"
+NEEDS_CHECK_LOG = HIDDEN / "needs-check.log"
+
+sys.path.insert(0, str(BASE))
+import store  # noqa: E402
+
+# 腾讯明确拒绝：服务端已应答并拒绝（botpy 的 _handle_response 收到
+# 错误状态才抛这些异常）。注意 ServerError（500/504 等）不在此列：
+# 不能证明消息未送达，按结果不明处理。
+DEFINITE_REJECTION = (
+    AuthenticationFailedError,  # 401
+    NotFoundError,              # 404
+    MethodNotAllowedError,      # 405
+    ForbiddenError,             # 403
+    SequenceNumberError,        # 429
+)
 
 # botpy 在 import 时调过一次 basicConfig（无 level，root 默认为 WARNING，
 # 且其后 basicConfig 是 no-op），又把 "botpy" logger 的 propagate 设为
@@ -80,48 +116,50 @@ _botpy_logger.propagate = False  # 否则记录会同时走 botpy logger 与 roo
 log = logging.getLogger("qq-daemon")
 
 
-def load_json(path, default):
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return default
+def _error_code(payload):
+    """回执里的错误码（code / err_code / errcode），非零才算。"""
+    for key in ("code", "err_code", "errcode"):
+        value = payload.get(key)
+        if isinstance(value, int) and value != 0:
+            return value
+        if isinstance(value, str) and value not in ("", "0"):
+            return value
+    return None
 
 
-def save_json(path, data):
-    path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
-
-
-def append_jsonl(path, item):
-    with path.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(item, ensure_ascii=False) + "\n")
+def classify_send_result(result):
+    """判定发送回执。返回 (kind, detail)：
+    - ('sent', id)：明确成功。botpy 原样返回服务端 JSON；发送成功
+      的回执是含新消息 id 的 dict（botpy 的 Message 类型含 id）。
+      只看“返回了 dict”不够：空 dict、错误 dict 都不是成功。
+    - ('rejected', detail)：dict 含非零错误码：服务端已应答并拒绝。
+    - ('unknown', detail)：其余一切（None、空 dict、无 id 无错误码、
+      非 dict）：无法证明送达。
+    """
+    if result is None:
+        return ("unknown", "botpy 返回 None：请求超时或断线重试耗尽，结果不明")
+    if not isinstance(result, dict):
+        return ("unknown", f"回执类型异常：{type(result).__name__}，无法确认送达")
+    sent_id = result.get("id")
+    if isinstance(sent_id, str) and sent_id:
+        return ("sent", sent_id)
+    code = _error_code(result)
+    if code is not None:
+        return ("rejected", f"腾讯返回错误码 {code}：{result.get('message', '')}")
+    return ("unknown", f"回执无 id、无错误码：{result!r}，无法确认送达")
 
 
 class Bridge(botpy.Client):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.seen = set(load_json(SEEN, []))
-        self.seq = load_json(SEQ, {})
+        db_path = os.environ.get("QQBOT_DB_PATH") or str(DB)
+        self.db = store.connect(db_path)
 
     def _enqueue(self, scene, msg_id, openid, author_id, content, raw):
-        if msg_id in self.seen:
-            return False
-        self.seen.add(msg_id)
-        if len(self.seen) > 5000:
-            self.seen = set(list(self.seen)[-5000:])
-        save_json(SEEN, sorted(self.seen))
-        append_jsonl(
-            QUEUE,
-            {
-                "scene": scene,
-                "msg_id": msg_id,
-                "openid": openid,
-                "author_id": author_id,
-                "content": content,
-                "raw": raw,
-            },
-        )
-        log.info("queued %s %s from %s: %s", scene, msg_id, openid, content[:80])
-        return True
+        if store.record_inbound(self.db, msg_id, scene, openid, content):
+            log.info("queued %s %s from %s: %s", scene, msg_id, openid, content[:80])
+            return True
+        return False
 
     async def on_c2c_message_create(self, message: C2CMessage):
         # C2CMessage 的 author 只有 user_openid，没有 id（2026-11-19 实测：
@@ -139,62 +177,76 @@ class Bridge(botpy.Client):
         self._enqueue("group", message.id, group_openid, author_id,
                       message.content or "", {"id": message.id, "repr": repr(message)})
 
-    def _next_seq(self, msg_id):
-        seq = int(self.seq.get(msg_id, 1))
-        self.seq[msg_id] = seq + 1
-        save_json(SEQ, self.seq)
-        return seq
+    def _alert_needs_check(self, msg_id, reason):
+        """结果不明：记日志 + 写 needs-check.log，供轮询任务巡检告警。"""
+        line = f"{time.strftime('%Y-%m-%dT%H:%M:%S%z')} {msg_id} {reason}"
+        log.warning("NEEDS_CHECK %s", line)
+        try:
+            with NEEDS_CHECK_LOG.open("a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except Exception as exc:
+            log.warning("needs-check log write failed: %s", exc)
 
-    async def _send_one(self, job):
-        scene = job.get("scene")
-        msg_id = job.get("msg_id")
-        text = job.get("text", "")
-        if not text or not msg_id:
-            return True
-        seq = self._next_seq(msg_id)
+    async def _send_one(self, row):
+        row_id = row["id"]
+        msg_id = row["msg_id"]
+        scene = row["scene"]
+        seq = row["seq"]
+        text = row["text"]
         try:
             if scene == "c2c":
-                await self.api.post_c2c_message(
-                    openid=job["openid"], content=text, msg_type=0,
+                result = await self.api.post_c2c_message(
+                    openid=row["openid"], content=text, msg_type=0,
                     msg_id=msg_id, msg_seq=seq)
             elif scene == "group":
-                await self.api.post_group_message(
-                    group_openid=job["openid"], content=text, msg_type=0,
+                result = await self.api.post_group_message(
+                    group_openid=row["openid"], content=text, msg_type=0,
                     msg_id=msg_id, msg_seq=seq)
             else:
-                return True
+                store.mark_failed(self.db, row_id, f"unknown scene: {scene}")
+                log.warning("send failed %s %s: unknown scene", scene, msg_id)
+                return
+        except DEFINITE_REJECTION as exc:
+            # 腾讯明确拒绝：服务端已应答并拒绝，终态，不自动重试。
+            store.mark_failed(self.db, row_id, f"{type(exc).__name__}: {exc}")
+            log.warning("send rejected %s %s seq=%s: %s", scene, msg_id, seq, exc)
+            return
         except Exception as exc:
-            log.warning("send failed %s %s seq=%s: %s", scene, msg_id, seq, exc)
-            return False
-        log.info("sent %s %s seq=%s", scene, msg_id, seq)
-        return True
+            # 超时、断线、其他异常：结果不明，不自动重发。
+            # 注意 asyncio.CancelledError 是 BaseException，不会被这里
+            # 捕获：进程退出时行保持 claimed，启动时 reconcile 处理。
+            store.mark_needs_check(self.db, row_id, f"{type(exc).__name__}: {exc}")
+            self._alert_needs_check(
+                msg_id, f"发送异常，结果不明：{type(exc).__name__}: {exc}")
+            return
+        kind, detail = classify_send_result(result)
+        if kind == "sent":
+            store.mark_sent(self.db, row_id, msg_id)
+            log.info("sent %s %s seq=%s id=%s", scene, msg_id, seq, detail)
+        elif kind == "rejected":
+            store.mark_failed(self.db, row_id, detail)
+            log.warning("send rejected %s %s seq=%s: %s", scene, msg_id, seq, detail)
+        else:
+            store.mark_needs_check(self.db, row_id, detail)
+            self._alert_needs_check(msg_id, detail)
 
-    async def outbox_loop(self):
+    async def send_loop(self):
+        # 启动时先处理上个进程遗留的 claimed 行：认领后、回执前的任何
+        # 时刻退出都会留下 claimed 行，一律转 needs_check 并告警，
+        # 不自动重发。
+        stale = store.reconcile_claimed(self.db)
+        for msg_id in stale:
+            self._alert_needs_check(msg_id, "daemon 重启时仍处于 claimed 状态，发送结果不明")
         while True:
             await asyncio.sleep(5)
-            if not OUTBOX.exists():
+            row = store.claim_next(self.db)
+            if row is None:
                 continue
-            try:
-                jobs = [json.loads(line) for line in
-                        OUTBOX.read_text(encoding="utf-8").splitlines() if line.strip()]
-            except Exception as exc:
-                log.warning("outbox read failed: %s", exc)
-                continue
-            remaining = []
-            for job in jobs:
-                if job.get("status") == "sent":
-                    continue
-                ok = await self._send_one(job)
-                if not ok:
-                    job["status"] = "failed"
-                    remaining.append(job)
-            OUTBOX.write_text(
-                "".join(json.dumps(j, ensure_ascii=False) + "\n" for j in remaining),
-                encoding="utf-8")
+            await self._send_one(row)
 
     async def on_ready(self):
         log.info("gateway ready, listening for C2C and group @ messages")
-        asyncio.create_task(self.outbox_loop())
+        asyncio.create_task(self.send_loop())
 
 
 def load_credentials():
