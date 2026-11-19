@@ -1,0 +1,8 @@
+hidden_files/
+__pycache__/
+*.log
+*.bak
+.venv/
+venv/
+.env
+.DS_Store
