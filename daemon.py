@@ -154,6 +154,12 @@ class Bridge(botpy.Client):
         super().__init__(*args, **kwargs)
         db_path = os.environ.get("QQBOT_DB_PATH") or str(DB)
         self.db = store.connect(db_path)
+        # 发送循环只起一个：网关重连会再次触发 on_ready，没有守卫
+        # 就会起第二个循环，第二个循环开头的 reconcile 会把第一个
+        # 循环正在发送的 claimed 行误当成旧进程遗留记录转 needs_check。
+        self._send_task = None
+        # 旧进程遗留的 claimed 行只在进程启动时恢复一次。
+        self._reconciled = False
 
     def _enqueue(self, scene, msg_id, openid, author_id, content, raw):
         if store.record_inbound(self.db, msg_id, scene, openid, content):
@@ -233,10 +239,15 @@ class Bridge(botpy.Client):
     async def send_loop(self):
         # 启动时先处理上个进程遗留的 claimed 行：认领后、回执前的任何
         # 时刻退出都会留下 claimed 行，一律转 needs_check 并告警，
-        # 不自动重发。
-        stale = store.reconcile_claimed(self.db)
-        for msg_id in stale:
-            self._alert_needs_check(msg_id, "daemon 重启时仍处于 claimed 状态，发送结果不明")
+        # 不自动重发。只做一次：循环重启（或 on_ready 重复触发）时
+        # 不再跑，否则会把正在发送的 claimed 行误当成遗留记录。
+        # 用 getattr：测试里有用 object.__new__ 绕开 __init__ 构造
+        # Bridge 的旧用法，属性缺失时按未恢复处理，不应崩。
+        if not getattr(self, "_reconciled", False):
+            self._reconciled = True
+            stale = store.reconcile_claimed(self.db)
+            for msg_id in stale:
+                self._alert_needs_check(msg_id, "daemon 重启时仍处于 claimed 状态，发送结果不明")
         while True:
             await asyncio.sleep(5)
             row = store.claim_next(self.db)
@@ -246,7 +257,16 @@ class Bridge(botpy.Client):
 
     async def on_ready(self):
         log.info("gateway ready, listening for C2C and group @ messages")
-        asyncio.create_task(self.send_loop())
+        # 只起一个发送循环：循环还活着时重复 READY 不再起新任务；
+        # 循环已退出（异常结束）时才重起。getattr 同上，兼容绕开
+        # __init__ 的构造方式。
+        task = getattr(self, "_send_task", None)
+        if task is None or task.done():
+            # 上一个循环已死：它留下的 claimed 行无人认领，新循环
+            # 启动时再恢复一次（转 needs_check + 告警，不重发）。
+            # 循环还活着时不走这里，所以在途发送不会被误恢复。
+            self._reconciled = False
+            self._send_task = asyncio.create_task(self.send_loop())
 
 
 def load_credentials():
