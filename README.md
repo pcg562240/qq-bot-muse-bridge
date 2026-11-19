@@ -4,8 +4,8 @@
 
 基于腾讯 **QQ 开放平台官方 Bot** + 官方 Python SDK `botpy`：扫码绑定登录，
 常驻网关收 C2C 私聊与群 @ 消息；回复逻辑不在本仓库——daemon 只负责传输，
-收到的消息写进 `hidden_files/queue.jsonl`，你的回复程序把回复写进
-`hidden_files/outbox.jsonl`，daemon 每 5 秒扫一次发出。
+收到的消息写进 `hidden_files/bridge.db`（SQLite 入站表），你的回复程序
+用 `enqueue_reply.py` 把回复写进出站表，daemon 每 5 秒认领一条发出。
 
 不走个人号逆向协议（NapCat / Lagrange 之类），不挂个人 QQ，没有封号风险。
 
@@ -13,12 +13,12 @@
 
 ```
 手机 QQ ──> 腾讯网关 ──> daemon.py (botpy 常驻)
-                              │ 入站写 queue.jsonl
+                              │ 入站写 bridge.db（inbound 表）
                               ▼
                         你的回复程序（Muse / LLM / 脚本）
-                              │ 回复写 outbox.jsonl
+                              │ 回复写 bridge.db（outbox 表）
                               ▼
-                        daemon.py 每 5 秒扫 outbox 发出
+                        daemon.py 每 5 秒认领一条发出
 ```
 
 登录走腾讯官方 Connector Portal 扫码绑定流程（与 OpenClaw `qqbot-cli`
@@ -39,33 +39,39 @@ python3 bind_qr.py poll           # 等待确认，成功后写 credentials.env 
 # 2. 起 daemon（默认沙箱网关）
 python3 daemon.py
 
-# 3. 回复程序：读 hidden_files/queue.jsonl，写 hidden_files/outbox.jsonl
-#    最小示例见 examples/echo_reply.py；生产可用任何 Agent 每分钟扫一轮
+# 3. 回复程序：list_pending.py 取待处理消息，enqueue_reply.py 写回复
+#    旧版文件队列示例见 examples/echo_reply.py（未随本次改动更新，仅供参考）；
+#    生产可用任何 Agent 每分钟扫一轮
 ```
 
 用 `examples/keepalive.sh` 托管 daemon：每 60 秒检查一次，挂了自动拉起，
 凭据错误时不反复拉起。
 
-## queue / outbox 协议
+## SQLite 队列协议
 
-`hidden_files/queue.jsonl` 每行一条入站消息：
+出站队列原来是 `hidden_files/outbox.jsonl`：daemon 整份读进内存、await
+腾讯接口、再整份重写——worker 在 await 期间追加的回复会被重写丢弃，
+且回复是否送达没有可靠记录。现改为 `hidden_files/bridge.db`（SQLite，
+WAL 模式），见 `MIGRATION.md`：
 
-```json
-{"scene": "c2c", "msg_id": "...", "openid": "发信人 user_openid",
- "author_id": "发信人 user_openid", "content": "消息正文", "raw": {"id": "...", "repr": "..."}}
-```
+- `inbound`：入站消息，`status` 为 pending / queued / done / missed /
+  legacy（旧版已处理、送达未核实）。
+- `outbox`：待发回复，`msg_id UNIQUE` 防重复排队，`status` 为 pending /
+  claimed / sent / failed / needs_check。
+- `seq_state`：每条原消息的下一个 `msg_seq`，在认领事务里分配并持久化。
 
-`scene` 为 `c2c`（私聊，`openid` 是对方 user_openid）或 `group`
-（群 @，`openid` 是 group_openid，`author_id` 是发信人 member_openid）。
+回复流程：`list_pending.py` 取 pending 的新入站消息 → 生成回复 →
+`enqueue_reply.py --msg-id ... --scene c2c|group --openid ... --text ...`
+入队（入队与原消息标记 queued 在同一个事务里；重复运行返回
+duplicate，不会多写）。daemon 每 5 秒从库里认领一条（短事务改
+claimed 并分配 seq），事务外调腾讯 API：只有收到含新消息 `id` 的回执
+才标 sent；腾讯明确拒绝（401/403/404/405/429）标 failed；返回 None、
+超时、断线或结果不明标 needs_check 并写 `needs-check.log` 告警，不自动
+重发。进程退出时遗留的 claimed 行，启动时转 needs_check。
 
-`hidden_files/outbox.jsonl` 每行一个待发回复：
-
-```json
-{"scene": "c2c", "openid": "对方 user_openid", "msg_id": "原消息 id", "text": "回复正文"}
-```
-
-daemon 每 5 秒扫一次 outbox：发出后移除，失败的标 `failed` 保留。
-同一 `msg_id` + `msg_seq` 重发会失败，`msg_seq` 由 daemon 按 msg_id 维护。
+旧版文件（`queue.jsonl` / `outbox.jsonl` / `seen.json` / `seq.json` /
+`poller-seen.json`）与新版不兼容，迁移与回滚见 `MIGRATION.md`；旧版
+文件队列示例 `examples/echo_reply.py` 未随本次改动更新。
 
 ## 回复限制（QQ 开放平台正式环境）
 
