@@ -190,15 +190,24 @@ def claim_next(conn):
 
 
 def mark_sent(conn, row_id, msg_id):
-    """收到明确成功回执：出站行 sent + 原消息 done，同一个事务。"""
+    """收到明确成功回执：出站行 claimed→sent + 原消息 done，同一个事务。
+
+    只有出站行确实从 claimed 转成 sent 时才把入站标 done；出站行
+    已是其他状态（已被 reconcile 转 needs_check 等）时不碰入站。
+    返回是否发生了 claimed→sent 转移。
+    """
     conn.execute("BEGIN IMMEDIATE")
     try:
-        conn.execute(
+        cur = conn.execute(
             "UPDATE outbox SET status='sent', updated_at=? WHERE id=? AND status='claimed'",
             (_now(), row_id))
+        if cur.rowcount != 1:
+            conn.execute("ROLLBACK")
+            return False
         conn.execute(
             "UPDATE inbound SET status='done' WHERE msg_id=?", (msg_id,))
         conn.execute("COMMIT")
+        return True
     except Exception:
         if conn.in_transaction:
             conn.execute("ROLLBACK")
