@@ -24,7 +24,8 @@
    逐条认领，不再整份重写共享文件。
 2. 「回复进入待发队列」与「原消息已处理」在 enqueue_reply 的同一个
    事务里：写入失败则原消息仍为 pending，下一轮可重处理；重复运行
-   只产生一条待发记录。
+   只产生一条待发记录。scene / openid 以原入站记录为准，传入值
+   不一致直接拒绝，不写出站行、不改入站状态。
 3. 发送结果不明不自动重发：先持久化认领状态（claimed + 已分配的
    seq），再在事务外调腾讯 API；只有明确成功回执才标记 sent。
 """
@@ -104,6 +105,8 @@ def list_pending_inbound(conn):
 def enqueue_reply(conn, msg_id, scene, openid, text):
     """worker 入队：INSERT 出站行 + inbound 改 queued，同一个事务。
 
+    scene / openid 以原入站记录为准：传入值（None 表示未提供）与原记录
+    不一致时报 ValueError，不写出站行、不改入站状态（事务回滚）。
     返回 ('enqueued', row_id) 或 ('duplicate', 已有 row_id)。
     inbound 行不存在、或状态已是 done/missed 时报 ValueError，
     调用方不应为这种消息写回复。
@@ -113,16 +116,25 @@ def enqueue_reply(conn, msg_id, scene, openid, text):
     conn.execute("BEGIN IMMEDIATE")
     try:
         row = conn.execute(
-            "SELECT status FROM inbound WHERE msg_id=?", (msg_id,)).fetchone()
+            "SELECT scene, openid, status FROM inbound WHERE msg_id=?",
+            (msg_id,)).fetchone()
         if row is None:
             raise ValueError(f"inbound row missing for {msg_id}")
+        if scene is not None and scene != row["scene"]:
+            raise ValueError(
+                f"scene mismatch for {msg_id}: caller passed {scene!r},"
+                f" inbound record has {row['scene']!r}")
+        if openid is not None and openid != row["openid"]:
+            raise ValueError(
+                f"openid mismatch for {msg_id}: caller passed {openid!r},"
+                f" inbound record has {row['openid']!r}")
         if row["status"] not in ("pending", "queued"):
             raise ValueError(f"inbound {msg_id} status is {row['status']}")
         try:
             cur = conn.execute(
                 "INSERT INTO outbox(msg_id, scene, openid, text, status, created_at, updated_at)"
                 " VALUES(?, ?, ?, ?, 'pending', ?, ?)",
-                (msg_id, scene, openid, text, _now(), _now()))
+                (msg_id, row["scene"], row["openid"], text, _now(), _now()))
         except sqlite3.IntegrityError:
             old = conn.execute(
                 "SELECT id FROM outbox WHERE msg_id=?", (msg_id,)).fetchone()

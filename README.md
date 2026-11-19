@@ -63,7 +63,9 @@ WAL 模式），见 `MIGRATION.md`：
 回复流程：`list_pending.py` 取 pending 的新入站消息 → 生成回复 →
 `enqueue_reply.py --msg-id ... --scene c2c|group --openid ... --text ...`
 入队（入队与原消息标记 queued 在同一个事务里；重复运行返回
-duplicate，不会多写）。daemon 每 5 秒从库里认领一条（短事务改
+duplicate，不会多写）。`scene` / `openid` 以原入站记录为准：传入值
+与原记录不一致直接拒绝（不写出站、不改入站状态），参数传 None 时
+用原记录的值。daemon 每 5 秒从库里认领一条（短事务改
 claimed 并分配 seq），事务外调腾讯 API：只有收到含新消息 `id` 的回执
 才标 sent；腾讯明确拒绝（401/403/404/405/429）标 failed；返回 None、
 超时、断线或结果不明标 needs_check 并写 `needs-check.log` 告警，不自动
