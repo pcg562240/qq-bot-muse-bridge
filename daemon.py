@@ -262,6 +262,10 @@ class Bridge(botpy.Client):
         # __init__ 的构造方式。
         task = getattr(self, "_send_task", None)
         if task is None or task.done():
+            # 上一个循环已死：它留下的 claimed 行无人认领，新循环
+            # 启动时再恢复一次（转 needs_check + 告警，不重发）。
+            # 循环还活着时不走这里，所以在途发送不会被误恢复。
+            self._reconciled = False
             self._send_task = asyncio.create_task(self.send_loop())
 
 
