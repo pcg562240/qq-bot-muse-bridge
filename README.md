@@ -110,6 +110,28 @@ err_code 40023002）再填服务器实际出口 IP。出口 IP 会轮换时白�
   且不挂 StreamHandler 到 stdout（否则每行进文件两份）
 - 长轮询断线、网关 1006 断开会重连，一般 10 秒内恢复
 
+## 发送停摆探针（只告警，`probe_send_stall.py`）
+
+保活只看 daemon 进程在不在。发送循环是进程里的一个 asyncio 任务，
+它异常退出后进程还活着、网关还连着，没有新的 READY 会再把它拉起来，
+出站行永远没人认领——本探针从库里看积压来发现这种停摆：
+
+```bash
+python3 probe_send_stall.py --db hidden_files/bridge.db --state-dir hidden_files/probe-state
+```
+
+每 60 秒调一次（单次检查）。只读打开库（URI `mode=ro` +
+`PRAGMA query_only=ON`）。`pending` 超 60 秒或 `claimed` 超 120 秒
+算积压信号；连续两轮同行卡住才告警（行换了 = 发送只是在慢走，不报），
+同一异常只报一次，干净一轮清除标记。告警写明待发数量和最老记录等了
+多久，写入 `send-stall-alerts.log`。退出码：0 无事/首轮信号/已报过，
+1 本轮告警，2 探针故障（库打不开或读不到，写入 `probe-errors.log`，
+不当成队列为空，也不当成发送停了）。
+
+**已知盲区：队列为空时探针发现不了发送循环已死。** 空队列没有积压
+信号可看；要覆盖这种情况需要 daemon 侧心跳或 fail-fast（循环异常
+退出即让进程退出，交给现有保活重启），不在本探针里。
+
 ## License
 
 MIT
