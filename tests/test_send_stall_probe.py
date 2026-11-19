@@ -18,6 +18,7 @@ pending 超 60 秒 / claimed 超 120 秒算积压信号；连续两轮同行卡�
   T15-E 队列为空时探针发现不了发送循环已死（已知盲区，见注释）
   T15-F 探针只读：跑完库文件字节与行内容不变
   T15-G CLI 实跑：两轮退出码 0 再 1，第二轮 stdout 有 SEND_STALL
+  T15-H 同一行持续卡住 10 分钟只报一次；恢复后新积压能重新告警
 """
 import hashlib
 import importlib.util
@@ -313,6 +314,43 @@ def _dump_rows(db):
         conn.close()
 
 
+def test_h_ten_minute_stall_single_alert():
+    """T15-H：同一行持续卡住至少 10 分钟只报一次；恢复后新积压能
+    重新告警。回归：旧去重逻辑里 180 秒窗口一过就会重置 first_seen
+    并重新告警（第 5 轮 first_signal、第 6 轮又 alert），新逻辑
+    一旦告警、同行仍卡住就不再因窗口过期重报。"""
+    with tempfile.TemporaryDirectory() as td:
+        probe = load_module(td, "probe_h", "probe_send_stall.py")
+        store = load_module(td, "store_h", "store.py")
+        db, conn = make_db(td, store)
+        sd = os.path.join(td, "state")
+        seed_pending(store, conn, "H-1", 200, BASE)
+        # 11 轮、每轮 +60 秒：覆盖 10 分钟（BASE..BASE+600）。
+        outcomes = [probe.check(db, sd, now=BASE + 60 * k)["outcome"]
+                    for k in range(11)]
+        check("T15-H 首轮 first_signal",
+              outcomes[0] == "first_signal", str(outcomes))
+        check("T15-H 第二轮 alert",
+              outcomes[1] == "alert", str(outcomes))
+        check("T15-H 之后 9 轮全是 already_alerted",
+              outcomes[2:] == ["already_alerted"] * 9, str(outcomes))
+        check("T15-H 10 分钟只报 1 次", len(alert_lines(sd)) == 1)
+        # 恢复：行发出，下一轮干净，标记清除。
+        mark_sent(conn, "H-1", BASE + 660)
+        r = probe.check(db, sd, now=BASE + 660)
+        check("T15-H 恢复后 ok", r["outcome"] == "ok", str(r))
+        # 新积压：重新走两轮确认再报。
+        seed_pending(store, conn, "H-2", 100, BASE + 720)
+        r1 = probe.check(db, sd, now=BASE + 720)
+        check("T15-H 新积压首轮 first_signal",
+              r1["outcome"] == "first_signal", str(r1))
+        r2 = probe.check(db, sd, now=BASE + 780)
+        check("T15-H 新积压第二轮 alert",
+              r2["outcome"] == "alert", str(r2))
+        check("T15-H 告警累计 2 行", len(alert_lines(sd)) == 2)
+        conn.close()
+
+
 def test_g_cli():
     """T15-G：CLI 实跑——停摆库两轮退出码 0 再 1，第二轮 stdout 告警。"""
     with tempfile.TemporaryDirectory() as td:
@@ -348,10 +386,11 @@ def test_g_cli():
 def main():
     tests = [test_a_normal, test_b_slow_recovers, test_c_dead_loop_alerts,
              test_d_probe_error, test_e_empty_queue_blind_spot,
-             test_f_read_only, test_g_cli]
+             test_f_read_only, test_g_cli,
+             test_h_ten_minute_stall_single_alert]
     for fn in tests:
         fn()
-    print("结果：T15 通过（7 项：正常/慢恢复/停摆告警/读库故障/空队盲区/只读/CLI）")
+    print("结果：T15 通过（8 项：正常/慢恢复/停摆告警/读库故障/空队盲区/只读/CLI/10 分钟单次告警）")
 
 
 if __name__ == "__main__":

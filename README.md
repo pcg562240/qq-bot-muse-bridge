@@ -122,11 +122,31 @@ python3 probe_send_stall.py --db hidden_files/bridge.db --state-dir hidden_files
 
 每 60 秒调一次（单次检查）。只读打开库（URI `mode=ro` +
 `PRAGMA query_only=ON`）。`pending` 超 60 秒或 `claimed` 超 120 秒
-算积压信号；连续两轮同行卡住才告警（行换了 = 发送只是在慢走，不报），
-同一异常只报一次，干净一轮清除标记。告警写明待发数量和最老记录等了
-多久，写入 `send-stall-alerts.log`。退出码：0 无事/首轮信号/已报过，
-1 本轮告警，2 探针故障（库打不开或读不到，写入 `probe-errors.log`，
-不当成队列为空，也不当成发送停了）。
+算积压信号；连续两轮同行卡住才告警（行换了 = 发送只是在慢走，不报）。
+180 秒窗口只用于首次两轮确认：一旦告警，同一行持续卡住时不再因
+窗口过期重新告警；该行离开积压后新积压重新走两轮确认再报。告警
+写明待发数量和最老记录等了多久，写入 `send-stall-alerts.log`。
+退出码含义是“本轮有没有新内容要报”：0 无事/首轮信号/已报过，
+1 本轮新告警，2 本轮新报的探针故障（库打不开或读不到，写入
+`probe-errors.log`，不当成队列为空，也不当成发送停了；同一故障
+重复出现时静默）。
+
+接线：`examples/keepalive-hook.sh` 是生产保活脚本加探针的版本
+（与 `~/hooks/scripts/qq-daemon-keepalive.sh` 逐行对照过，只改了
+QQ_D 可环境变量覆盖 + 存活分支里的探针调用）。探针只在 daemon
+存活时跑，exit 1/2 时调 `wake` 告警，`||` 接住非零退出所以不会
+中断保活、不会触发重启；探针文件不存在时静默跳过。
+
+启用（部署时）：
+1. 把 `probe_send_stall.py` 拷到生产 goal 目录（`$QQ_D/` 下）。
+2. 把 `examples/keepalive-hook.sh` 拷到
+   `~/hooks/scripts/qq-daemon-keepalive.sh`（先备份旧脚本）。
+3. 不用重启：下一个 60 秒 tick 自动生效。验证：手动跑一次
+   `probe_send_stall.py --db $QQ_D/hidden_files/bridge.db --state-dir $QQ_D/hidden_files/probe-state`，
+   健康时应 exit 0 且静默。
+停用：删掉 `$QQ_D/probe_send_stall.py`（守卫会静默跳过探针），或
+把 hook 脚本恢复成备份的旧版本；两种都不用重启。状态目录
+`hidden_files/probe-state` 可随手删掉（删了只丢去重记忆）。
 
 **已知盲区：队列为空时探针发现不了发送循环已死。** 空队列没有积压
 信号可看；要覆盖这种情况需要 daemon 侧心跳或 fail-fast（循环异常

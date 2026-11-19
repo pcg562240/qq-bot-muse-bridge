@@ -9,11 +9,12 @@
 用法（由保活 hook 或每分钟定时任务每 60 秒调一次，单次检查）：
   python3 probe_send_stall.py --db <bridge.db 路径> --state-dir <状态目录>
 
-退出码：
+退出码（含义是“本轮有没有新内容要报”，不是“当前有没有问题”）：
   0  正常 / 首次积压信号（等下一轮确认）/ 同一异常已报过（静默）
   1  本轮确认告警（已把告警行写入 send-stall-alerts.log 并打印到 stdout）
-  2  探针故障：数据库打不开或读不到（已把故障行写入 probe-errors.log
-     并打印到 stdout）。这不是“队列为空”，也不是“发送停了”。
+  2  本轮新报的探针故障：数据库打不开或读不到（已把故障行写入
+     probe-errors.log 并打印到 stdout）。同一故障重复出现时静默
+     （exit 0）。这不是“队列为空”，也不是“发送停了”。
 
 积压信号（阈值可调）：
   pending 行 created_at 超过 60 秒未被认领，或 claimed 行 updated_at
@@ -23,10 +24,12 @@
 确认规则（防抖）：
   连续两轮都看到积压才告警，且第二轮的最老积压行必须是同一条
   msg_id（同行卡住 = 循环停了；行换了 = 发送只是在慢走，照常流动
-  的慢发送不会误报）。同一异常只报一次：报过后不再重复，直到一轮
-  干净（无积压）才清除标记，之后的新异常重新走两轮确认。
-  状态记在 --state-dir/probe-state.json；状态文件损坏按无状态处理。
-  上一轮信号超过 180 秒（探针停跑过）不算连续，重新从首轮信号计。
+  的慢发送不会误报）。180 秒窗口只用于首次两轮确认：一旦告警，
+  同一行持续卡住时不再因窗口过期重新告警——已告警的异常只有在
+  该行离开积压（发出或转终态）后才算结束；之后的新积压重新走
+  两轮确认再报。状态记在 --state-dir/probe-state.json；状态文件
+  损坏按无状态处理。上一轮信号超过 180 秒（探针停跑过）不算连续，
+  重新从首轮信号计。
 
 探针故障单独处理：
   打开或读库抛任何异常（文件不存在、不是数据库、权限、锁超时等）
@@ -196,7 +199,8 @@ def check(db_path, state_dir, now=None,
             _append_log(state_dir, ERROR_LOG, line)
             return {"outcome": "probe_error", "exit_code": EXIT_PROBE_ERROR,
                     "error": error, "text": line, "reported": True}
-        return {"outcome": "probe_error", "exit_code": EXIT_PROBE_ERROR,
+        # 同一故障已报过：本轮无新内容，静默（exit 0），不重复告警。
+        return {"outcome": "probe_error", "exit_code": EXIT_OK,
                 "error": error, "text": _error_text(error, now),
                 "reported": False}
 
@@ -215,6 +219,13 @@ def check(db_path, state_dir, now=None,
         return {"outcome": "ok", "exit_code": EXIT_OK, "stale": stale}
 
     # --- 有积压：两轮确认，同行卡住才告警 ---
+    # 已告警且同一行仍卡着：180 秒窗口只用于首次两轮确认，一旦告警
+    # 就不再因窗口过期重新告警。只有该行离开积压（发出或转终态），
+    # 本次异常才算结束；之后的新积压重新走两轮确认。
+    if (state.get("alerted")
+            and state.get("oldest_msg_id") == stale["oldest_msg_id"]):
+        return {"outcome": "already_alerted", "exit_code": EXIT_OK,
+                "stale": stale}
     first_seen = state.get("first_seen")
     prev_oldest = state.get("oldest_msg_id")
     confirmed = (
@@ -229,9 +240,7 @@ def check(db_path, state_dir, now=None,
         _save_state(state_dir, state)
         return {"outcome": "first_signal", "exit_code": EXIT_OK,
                 "stale": stale}
-    if state.get("alerted"):
-        return {"outcome": "already_alerted", "exit_code": EXIT_OK,
-                "stale": stale}
+    # 到这里：同行连续两轮确认，且尚未告警（已告警同行已在上面返回）。
     state["alerted"] = True
     _save_state(state_dir, state)
     line = _alert_text(stale, now)
